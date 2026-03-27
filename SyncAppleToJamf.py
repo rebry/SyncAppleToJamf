@@ -3,7 +3,7 @@
 # Organisation: Eplehuset
 # Version:      1.0
 # Created:      2026-03-26
-# Last updated: 2026-03-26
+# Last updated: 2026-03-27
 # Description:  Syncs purchasing data from Apple Business Manager or Apple
 #               School Manager into Jamf Pro for all matched computers and
 #               mobile devices. Matches devices by serial number and writes
@@ -317,7 +317,7 @@ def http_get(url: str, token: str, retries: int = 3) -> dict:
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 wait = 2 + (attempt * 2)   # 2s, 4s, 6s
-                log_warning(f"Rate limited by Apple — waiting {wait}s before retry {attempt + 1}/{retries}...")
+                log_warning(f"Rate limited (HTTP 429) — waiting {wait}s before retry {attempt + 1}/{retries}...")
                 time.sleep(wait)
             elif e.code == 404:
                 log_debug(f"404 Not Found: {url}")
@@ -379,11 +379,12 @@ def ensure_computer_eas(jamf_token: str) -> dict:
         else:
             log_warning(f"Computer EA missing: {name} — creating...")
             payload = json.dumps({
-                "name":        name,
-                "description": ea_def["description"],
-                "dataType":    ea_def["dataType"],
-                "inputType":   ea_def["inputType"],
-                "enabled":     True,
+                "name":                 name,
+                "description":          ea_def["description"],
+                "dataType":             ea_def["dataType"],
+                "inputType":            ea_def["inputType"],
+                "inventoryDisplayType": "PURCHASING",
+                "enabled":              True,
             }).encode()
             req = urllib.request.Request(
                 f"{JAMF_URL}/api/v1/computer-extension-attributes",
@@ -629,7 +630,6 @@ def fetch_applecare_coverage(serial: str, asm_token: str) -> dict:
 #
 # Apple field               → Jamf Pro field (computers + mobile devices)
 # ───────────────────────────────────────────────────────────────────────
-# purchaseSourceType        → purchased / leased
 # orderDateTime             → poDate
 # orderNumber               → poNumber
 # purchaseSourceId          → vendor  (mapped via VENDOR_MAP)
@@ -645,20 +645,19 @@ def build_jamf_purchasing_payload(asm_attributes: dict, applecare: dict, ea_id_m
     """
     Build the JSON body for PATCH /api/v3/computers-inventory-detail/{id}.
 
+    The Jamf Pro v3 API expects extensionAttributes at the top level of the
+    request body, as a sibling of purchasing — not nested inside it.
+
     ea_id_map — name→id dict returned by ensure_computer_eas(), used so
                 extension attributes are referenced by their live Jamf ID
                 rather than hardcoded values.
     """
-    is_lease = asm_attributes.get("purchaseSourceType", "") == "LEASE"
-
     order_date = (asm_attributes.get("orderDateTime") or "")[:10] or None
     po_number  = asm_attributes.get("orderNumber") or None
     vendor_raw = asm_attributes.get("purchaseSourceId") or None
     vendor     = VENDOR_MAP.get(vendor_raw, vendor_raw)   # map code → name if known
 
-    standard_fields = {
-        "purchased":    not is_lease,
-        "leased":       is_lease,
+    purchasing_fields = {
         "poDate":       order_date,
         "poNumber":     po_number,
         "vendor":       vendor,
@@ -679,7 +678,8 @@ def build_jamf_purchasing_payload(asm_attributes: dict, applecare: dict, ea_id_m
         if def_id is not None and value is not None
     ]
 
-    payload = {field: value for field, value in standard_fields.items() if value is not None}
+    # extensionAttributes must be top-level in the request body, not inside purchasing
+    payload = {"purchasing": {k: v for k, v in purchasing_fields.items() if v is not None}}
     if extension_attributes:
         payload["extensionAttributes"] = extension_attributes
 
@@ -696,7 +696,6 @@ def build_mobile_device_payload(asm_attributes: dict, applecare: dict) -> dict:
 
     Dates must be in ISO 8601 format with time component (YYYY-MM-DDT00:00:00Z).
     """
-    is_lease   = asm_attributes.get("purchaseSourceType", "") == "LEASE"
     order_date = (asm_attributes.get("orderDateTime") or "")[:10] or None
     po_number  = asm_attributes.get("orderNumber") or None
     vendor_raw = asm_attributes.get("purchaseSourceId") or None
@@ -705,7 +704,7 @@ def build_mobile_device_payload(asm_attributes: dict, applecare: dict) -> dict:
     warranty_date  = applecare.get("warrantyDate")
     apple_care_id  = applecare.get("appleCareId")
 
-    purchasing = {"purchased": not is_lease, "leased": is_lease}
+    purchasing = {}
     if po_number:
         purchasing["poNumber"] = po_number
     if vendor:
@@ -834,7 +833,7 @@ def main():
     # Work out which serials appear in both systems — computers
     comp_matched  = {s for s in asm_devices if s in jamf_computers}
     comp_asm_only = {s for s in asm_devices if s not in jamf_computers}
-    comp_jamf_only= {s for s in jamf_computers if s not in asm_devices}
+    comp_jamf_only = {s for s in jamf_computers if s not in asm_devices}
 
     # Work out which serials appear in both systems — mobile devices
     mob_matched   = {s for s in asm_devices if s in jamf_mobile_devices}
@@ -867,6 +866,8 @@ def main():
     comp_updated = []
     comp_failed  = []
 
+    ea_id_to_name = {v: k for k, v in ea_id_map.items()}   # inverted for readable logging
+
     for serial in sorted(comp_matched):
         asm_data  = asm_devices[serial]
         jamf_info = jamf_computers[serial]
@@ -876,24 +877,23 @@ def main():
         log(f"  ── {serial}  |  {jamf_name}  (Jamf ID: {jamf_id})")
 
         time.sleep(ASM_RATE_LIMIT_DELAY_SECONDS)
-        applecare  = fetch_applecare_coverage(serial, asm_token)
-        purchasing = build_jamf_purchasing_payload(asm_data, applecare, ea_id_map)
+        applecare = fetch_applecare_coverage(serial, asm_token)
+        payload   = build_jamf_purchasing_payload(asm_data, applecare, ea_id_map)
 
-        for field, value in purchasing.items():
-            if field == "extensionAttributes":
-                for ea in value:
-                    log_detail(f"EA [{ea['definitionId']}]", ea["values"][0])
-            else:
-                log_detail(field, value)
+        for field, value in payload.get("purchasing", {}).items():
+            log_detail(field, value)
+        for ea in payload.get("extensionAttributes", []):
+            ea_label = ea_id_to_name.get(ea["definitionId"], f"EA [{ea['definitionId']}]")
+            log_detail(f"EA: {ea_label}", ea["values"][0])
 
         jamf_token = get_jamf_access_token()   # refresh before write
         status = http_patch(
             url   = f"{JAMF_URL}/api/v3/computers-inventory-detail/{jamf_id}",
             token = jamf_token,
-            body  = {"purchasing": purchasing},
+            body  = payload,
         )
 
-        if status == 204:
+        if status == 204:   # Jamf v3 returns 204 No Content on success
             log_success("Updated successfully\n")
             comp_updated.append(serial)
         else:
@@ -932,7 +932,7 @@ def main():
             body  = payload,
         )
 
-        if status == 200:
+        if status == 200:   # Jamf v2 returns 200 OK on success
             log_success("Updated successfully\n")
             mob_updated.append(serial)
         else:
