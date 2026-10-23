@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Author:       Per Kristian Thorsen
-# Organisation: Eplehuset
 # Version:      1.0
 # Created:      2026-03-26
 # Last updated: 2026-03-27
